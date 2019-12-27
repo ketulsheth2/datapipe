@@ -1,0 +1,115 @@
+---
+version: '2'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:5.3.1
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  broker:
+    image: confluentinc/cp-enterprise-kafka:5.3.1
+    hostname: broker
+    container_name: broker
+    depends_on:
+      - zookeeper
+    ports:
+      - '9092:9092'
+      - '29094:29094'
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: EXTERNAL://localhost:29094,INTERNAL://broker:9092
+      KAFKA_LISTENERS: EXTERNAL://0.0.0.0:29094,INTERNAL://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+  ksql-server:
+    image: confluentinc/cp-ksql-server:5.3.0
+    hostname: ksql-server
+    container_name: ksql-server
+    depends_on:
+      - broker
+    ports:
+      - "8090:8090"
+    environment:
+      KSQL_LISTENERS: http://0.0.0.0:8090
+      KSQL_BOOTSTRAP_SERVERS: broker:9092
+      KSQL_KSQL_LOGGING_PROCESSING_STREAM_AUTO_CREATE: "true"
+      KSQL_KSQL_LOGGING_PROCESSING_TOPIC_AUTO_CREATE: "true"
+
+  ksql-cli:
+    image: confluentinc/cp-ksql-cli:5.3.1
+    container_name: ksql-cli
+    depends_on:
+      - broker
+      - ksql-server
+    volumes:
+      - /home/kafka/workspace/graymatter/ksql:/srv/docker/ksql
+    entrypoint: 
+      - /bin/bash
+      - -c
+      - |
+        echo -e "\n\n⏳ Waiting for KSQL to be available before launching CLI\n"
+        while [ $$(curl -s -o /dev/null -w %{http_code} http://ksql-server:8090/info) -eq 000 ] 
+        do
+          echo -e $$(date) "KSQL Server HTTP state: " $$(curl -s -o /dev/null -w %{http_code} http://ksql-server:8090/info) " (waiting for 200)"
+          sleep 5
+        done
+        echo -e "\n\n-> Running KSQL commands\n"
+        sleep 5
+        cat /srv/docker/ksql/device_count/commands.sql <(echo 'EXIT')| ksql http://ksql-server:8090
+        echo -e "\n\n-> Sleeping…\n"
+        sleep infinity
+
+  influxdb:
+    image: influxdb:1.7.9
+    container_name: influxdb
+    depends_on:
+      - ksql-cli
+    ports:
+      - "8086:8086"
+    volumes:
+      - /srv/docker/influxdb/data:/var/lib/influxdb
+  
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    depends_on:
+      - influxdb
+    ports:
+      - '3000:3000'
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - grafana-provisioning:/etc/grafana/provisioning
+ 
+  myconsumer-app:
+    container_name: myconsumer
+    build: ../consumer
+    depends_on:
+      - broker
+      - ksql-server
+      - ksql-cli
+      - influxdb
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache curl;
+        echo Waiting for influxdb API ...;
+        while ! nc -z influxdb 8086;
+        do
+          sleep 5;
+        done;
+        echo InfluxDB Ready ...; python consumer.py
+
+volumes:
+  grafana-storage:
+  grafana-provisioning:
